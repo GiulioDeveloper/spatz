@@ -213,6 +213,21 @@ sw.vlt: clean.sw bin/spatz_cluster.vlt
 sw.test.vlt: sw.vlt
 	cd sw/build && make test
 
+
+.PHONY: traces
+traces: $(shell (ls logs/trace_hart_*.dasm 2>/dev/null | sed 's/\.dasm/\.txt/') || echo "")
+
+logs/trace_hart_%.txt: logs/trace_hart_%.dasm ${ROOT}/util/gen_trace.py
+	$(PYTHON) ${ROOT}/util/gen_trace.py $< --mc-exec ${LLVM_INSTALL_DIR}/bin/llvm-mc > $@
+
+# make annotate
+# Generate source-code interleaved traces for all harts. Reads the binary from
+# the logs/.rtlbinary file that is written at start of simulation in the vsim script
+logs/trace_hart_%.s: logs/trace_hart_%.txt ${ROOT}/util/trace/annotate.py
+	$(PYTHON) ${ROOT}/util/trace/annotate.py -q -o $@ $(BINARY) $<
+BINARY ?= $(shell cat logs/.rtlbinary)
+annotate: $(shell (ls logs/trace_hart_*.dasm 2>/dev/null | sed 's/\.dasm/\.s/') || echo "")
+
 ## Delete sw/build
 clean.sw:
 	rm -rf sw/build

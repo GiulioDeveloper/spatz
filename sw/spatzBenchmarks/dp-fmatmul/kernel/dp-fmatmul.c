@@ -45,7 +45,7 @@ void matmul_2xVL(double *c, const double *a, const double *b,
   while (p < p_end) {
     // Calculate the vl
     size_t gvl;
-    asm volatile("vsetvli %[gvl], %[vl], e64, m8, ta, ma"
+    asm volatile("vsetvli %[gvl], %[vl], e64, m4, ta, ma"
                  : [gvl] "=r"(gvl)
                  : [vl] "r"(p_end - p));
 

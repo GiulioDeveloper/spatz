@@ -16,13 +16,17 @@ import re
 import math
 import argparse
 import json
+import subprocess
 from ctypes import c_int32, c_uint32
 from collections import deque, defaultdict
+from functools import lru_cache
 
 EXTRA_WB_WARN = "WARNING: {} transactions still in flight for {}."
 
 GENERAL_WARN = """WARNING: Inconsistent final state; performance metrics
 may be inaccurate. Is this trace complete?\n"""
+
+DASM_IN_REGEX = r'DASM\(([0-9a-fA-F]+)\)'
 
 TRACE_IN_REGEX = r"(\d+)\s+(\d+)\s+(\d+)\s+(0x[0-9A-Fa-fz]+)\s+([^#;]*)(\s*#;\s*(.*))?"
 
@@ -35,17 +39,17 @@ MAX_SIGNED_INT_LIT = 0xFFFF
 
 # Performance keys which only serve to compute other metrics: omit on printing
 PERF_EVAL_KEYS_OMIT = (
-    "start",
-    "end",
-    "end_fpss",
-    "snitch_issues",
-    "snitch_load_latency",
-    "snitch_fseq_offloads",
-    "fseq_issues",
-    "fpss_issues",
-    "fpss_fpu_issues",
-    "fpss_load_latency",
-    "fpss_fpu_latency",
+    # "start",
+    # "end",
+    # "end_fpss",
+    # "snitch_issues",
+    # "snitch_load_latency",
+    # "snitch_fseq_offloads",
+    # "fseq_issues",
+    # "fpss_issues",
+    # "fpss_fpu_issues",
+    # "fpss_load_latency",
+    # "fpss_fpu_latency",
 )
 
 # -------------------- Architectural constants and enums  --------------------
@@ -332,6 +336,24 @@ PRIV_LVL = {"3": "M", "1": "S", "0": "U"}
 
 # -------------------- FPU helpers  --------------------
 
+@lru_cache(maxsize=256)
+def disasm_inst(hex_inst, mc_exec='llvm-mc', mc_flags='-disassemble -mcpu=snitch --mattr=a --mattr=v --mattr=m --mattr=zfh'):
+    """Disassemble a single RISC-V instruction using llvm-mc."""
+    # Reverse the endianness of the hex instruction
+    inst_fmt = ' '.join(f'0x{byte:02x}' for byte in bytes.fromhex(hex_inst)[::-1])
+
+    # Use llvm-mc to disassemble the binary instruction
+    result = subprocess.run(
+        [mc_exec] + mc_flags.split(),
+        input=inst_fmt,
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+        check=True,
+    )
+
+    # Extract disassembled instruction from llvm-mc output
+    return result.stdout.splitlines()[-1].strip().replace('\t', ' ')
+
 
 def flt_oper(extras: dict, port: int) -> (str, str):
     op_sel = extras["op_sel_{}".format(port)]
@@ -439,7 +461,8 @@ def annotate_snitch(
     if not (extras["stall"]) and extras["exception"]:
         ret.append("exception")
     # Regular linear datapath operation
-    if not (extras["stall"] or extras["fpu_offload"]):
+    # if not (extras["stall"] or extras["fpu_offload"]):
+    if not (extras["stall"]):
         # Operand registers
         if extras["opa_select"] == OPER_TYPES["gpr"] and extras["rs1"] != 0:
             ret.append(
@@ -538,16 +561,25 @@ def annotate_insn(
     dict,
     fseq_info: dict,  # Info on the sequencer to properly map tunneled instruction PCs
     perf_metrics: list,  # A list performance metric dicts
+    mc_exec: str,  # Path to the llvm-mc executable
     dupl_time_info: bool = True,  # Show sim time and cycle again if same as previous line?
     last_time_info: tuple = None,  # Previous timestamp (keeps this method stateless)
     annot_fseq_offl: bool = False,  # Annotate whenever core offloads to CPU on own line
     force_hex_addr: bool = True,
     permissive: bool = True,
-) -> (
-    str,
-    tuple,
-    bool,
-):  # Return time info, whether trace line contains no info, and fseq_len
+) -> (str, tuple, bool):
+      # Return time info, whether trace line contains no info, and fseq_len
+
+
+    match = re.search(DASM_IN_REGEX, line)
+
+    if match is not None and not all(c == '0' for c in match.groups()[0]):
+        line = re.sub(
+            DASM_IN_REGEX,
+            disasm_inst(match.groups()[0], mc_exec),
+            line,
+        )
+
     match = re.search(TRACE_IN_REGEX, line.strip("\n"))
     if match is None:
         raise ValueError("Not a valid trace line:\n{}".format(line))
@@ -577,8 +609,9 @@ def annotate_insn(
                 )
                 if extras["is_seq_insn"]:
                     fseq_info["fseq_pcs"].appendleft(pc_str)
-            if extras["stall"] or extras["fpu_offload"]:
+            if extras["stall"]:
                 insn, pc_str = ("", "")
+                pass
             else:
                 perf_metrics[-1]["snitch_issues"] += 1
         else:
@@ -678,6 +711,16 @@ def main():
         type=argparse.FileType("w"),
         help="Dump performance metrics as json text.",
     )
+    parser.add_argument(
+        '--mc-exec',
+        default='llvm-mc',
+        help='Path to the llvm-mc executable'
+    )
+    # parser.add_argument(
+    #     '--mc-flags',
+    #     default='-disassemble -mcpu=snitch',
+    #     help='Flags to pass to the llvm-mc executable'
+    # )
 
     args = parser.parse_args()
     line_iter = iter(args.infile.readline, b"")
@@ -705,6 +748,7 @@ def main():
                 fpr_wb_info,
                 fseq_info,
                 perf_metrics,
+                args.mc_exec,
                 False,
                 time_info,
                 args.offl,
@@ -721,6 +765,7 @@ def main():
     # Emit metrics
     print("\n## Performance metrics")
     for idx in range(len(perf_metrics)):
+        print("Printing metrics for section {}:".format(idx))
         print("\n" + fmt_perf_metrics(perf_metrics, idx, not args.allkeys))
 
     if args.dump_perf:
